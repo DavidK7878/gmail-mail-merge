@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: 'Google Sans', Roboto, Arial, sans-serif; font-size: 13px; margin: 0; padding: 12px; color: #202124; }
+    h3 { margin: 0 0 10px; font-size: 15px; }
+    label { display: block; margin: 10px 0 4px; font-weight: 500; }
+    select { width: 100%; padding: 6px; box-sizing: border-box; }
+    button { margin: 4px 4px 0 0; padding: 7px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    button:disabled { opacity: .5; cursor: default; }
+    .primary { background: #1a73e8; color: #fff; }
+    .secondary { background: #e8eaed; color: #202124; }
+    .danger { background: #fce8e6; color: #c5221f; }
+    .stats { background: #f1f3f4; border-radius: 6px; padding: 8px 10px; margin: 12px 0; line-height: 1.7; }
+    .stats b { float: right; }
+    #status { margin-top: 10px; min-height: 18px; font-size: 12px; }
+    #status.err { color: #c5221f; }
+    #status.ok { color: #188038; }
+    #preview { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; margin-top: 8px; max-height: 260px; overflow: auto; background: #fff; }
+    #previewSubject { font-weight: 600; margin-bottom: 6px; }
+    .muted { color: #5f6368; font-size: 12px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge.on { background: #e6f4ea; color: #188038; }
+    .badge.off { background: #f1f3f4; color: #5f6368; }
+  </style>
+</head>
+<body>
+  <h3>Mail Merge <span id="sendingBadge" class="badge off">idle</span></h3>
+
+  <label for="draft">Template (Gmail draft)</label>
+  <select id="draft"></select>
+  <button class="secondary" onclick="loadData()">↻ Refresh</button>
+  <button class="secondary" onclick="preview()">Preview row</button>
+
+  <div id="previewWrap" style="display:none">
+    <div id="preview">
+      <div id="previewSubject"></div>
+      <div class="muted" id="previewTo"></div>
+      <hr style="border:none;border-top:1px solid #eee">
+      <div id="previewBody"></div>
+    </div>
+  </div>
+
+  <div class="stats">
+    Pending recipients <b id="pending">–</b><br>
+    Sent <b id="sent">–</b><br>
+    Gmail quota left today <b id="quota">–</b>
+  </div>
+
+  <button class="secondary" onclick="sendTest()" id="btnTest">Send test to myself</button>
+  <button class="primary" onclick="start()" id="btnStart">Start sending</button>
+  <button class="danger" onclick="pause()" id="btnPause">Pause</button>
+
+  <div id="status"></div>
+  <p class="muted">Sends go out in small batches every few minutes, spaced 30–90s apart, inside your send window. You can close this Sheet — sending continues.</p>
+
+  <script>
+    function $(id) { return document.getElementById(id); }
+    function setStatus(msg, cls) { var s = $('status'); s.textContent = msg || ''; s.className = cls || ''; }
+    function busy(b) { ['btnTest', 'btnStart', 'btnPause'].forEach(function (id) { $(id).disabled = b; }); }
+
+    function loadData() {
+      setStatus('Loading…');
+      google.script.run
+        .withSuccessHandler(function (d) {
+          var sel = $('draft');
+          var current = sel.value;
+          sel.innerHTML = '';
+          d.drafts.forEach(function (s) {
+            var o = document.createElement('option');
+            o.value = o.textContent = s;
+            sel.appendChild(o);
+          });
+          if (d.selected && d.drafts.indexOf(d.selected) !== -1) sel.value = d.selected;
+          else if (current) sel.value = current;
+          $('pending').textContent = d.pending;
+          $('sent').textContent = d.sent;
+          $('quota').textContent = d.quotaRemaining;
+          var badge = $('sendingBadge');
+          badge.textContent = d.sending ? 'sending' : 'idle';
+          badge.className = 'badge ' + (d.sending ? 'on' : 'off');
+          setStatus('');
+        })
+        .withFailureHandler(function (e) { setStatus(e.message, 'err'); })
+        .getSidebarData();
+    }
+
+    function preview() {
+      var subject = $('draft').value;
+      if (!subject) return setStatus('No draft selected.', 'err');
+      setStatus('Building preview…');
+      google.script.run
+        .withSuccessHandler(function (p) {
+          $('previewWrap').style.display = 'block';
+          $('previewSubject').textContent = p.subject;
+          $('previewTo').textContent = 'To: ' + p.to + ' (row ' + p.row + ')';
+          $('previewBody').innerHTML = p.htmlBody;
+          setStatus('');
+        })
+        .withFailureHandler(function (e) { setStatus(e.message, 'err'); })
+        .previewMerge(subject);
+    }
+
+    function sendTest() {
+      var subject = $('draft').value;
+      if (!subject) return setStatus('No draft selected.', 'err');
+      busy(true); setStatus('Sending test…');
+      google.script.run
+        .withSuccessHandler(function (msg) { busy(false); setStatus(msg, 'ok'); })
+        .withFailureHandler(function (e) { busy(false); setStatus(e.message, 'err'); })
+        .sendTestToMyself(subject);
+    }
+
+    function start() {
+      var subject = $('draft').value;
+      if (!subject) return setStatus('No draft selected.', 'err');
+      if (!confirm('Start sending "' + subject + '" to all pending rows?')) return;
+      busy(true); setStatus('Starting…');
+      google.script.run
+        .withSuccessHandler(function (msg) { busy(false); setStatus(msg, 'ok'); loadData(); })
+        .withFailureHandler(function (e) { busy(false); setStatus(e.message, 'err'); })
+        .startSending(subject);
+    }
+
+    function pause() {
+      busy(true); setStatus('Pausing…');
+      google.script.run
+        .withSuccessHandler(function () { busy(false); setStatus('Paused.', 'ok'); loadData(); })
+        .withFailureHandler(function (e) { busy(false); setStatus(e.message, 'err'); })
+        .pauseSending();
+    }
+
+    loadData();
+  </script>
+</body>
+</html>
