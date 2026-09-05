@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: 'Google Sans', Roboto, Arial, sans-serif; font-size: 13px; margin: 0; padding: 12px; color: #202124; }
+    h3 { margin: 0 0 10px; font-size: 15px; }
+    h4 { margin: 14px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #5f6368; }
+    button { margin: 4px 4px 0 0; padding: 7px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    button:disabled { opacity: .5; cursor: default; }
+    .primary { background: #1a73e8; color: #fff; }
+    .secondary { background: #e8eaed; color: #202124; }
+    .danger { background: #fce8e6; color: #c5221f; }
+    .stats { background: #f1f3f4; border-radius: 6px; padding: 8px 10px; margin: 8px 0; line-height: 1.7; }
+    .stats b { float: right; }
+    .row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+    .row input { flex: 1; padding: 6px; border: 1px solid #dadce0; border-radius: 4px; font-size: 12px; }
+    #status { margin-top: 10px; min-height: 18px; font-size: 12px; white-space: pre-wrap; }
+    #status.err { color: #c5221f; }
+    #status.ok { color: #188038; }
+    .muted { color: #5f6368; font-size: 12px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; margin-left: 4px; }
+    .badge.on { background: #e6f4ea; color: #188038; }
+    .badge.off { background: #f1f3f4; color: #5f6368; }
+    .badge.warn { background: #fef7e0; color: #b06000; }
+    .progress { font-size: 12px; color: #1a73e8; margin-top: 4px; }
+    label.chk { display: block; margin-top: 6px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h3>CRM <span id="scanBadge" class="badge off">idle</span></h3>
+
+  <div class="stats">
+    Contacts in Master <b id="contacts">–</b><br>
+    Unclassified <b id="unclassified">–</b><br>
+    Waiting on your reply <b id="needsReply">–</b><br>
+    Dormant <b id="dormant">–</b>
+  </div>
+
+  <h4>1 · Scan sent mail</h4>
+  <div class="muted">Reads your Gmail "Sent" folder and builds the Master tab. Incremental picks up where the last scan stopped.</div>
+  <button class="primary" id="btnScan" onclick="scan(false)">Scan new mail</button>
+  <button class="secondary" id="btnFull" onclick="scan(true)">Full rescan</button>
+  <button class="danger" id="btnStopScan" onclick="stopScan()">Stop</button>
+  <div class="progress" id="scanProgress"></div>
+
+  <h4>2 · Classify with Claude <span id="keyBadge" class="badge off">no key</span></h4>
+  <div class="muted" id="modelLine"></div>
+  <button class="primary" id="btnClassify" onclick="classify('unclassified')">Classify unclassified</button>
+  <button class="secondary" id="btnReclassify" onclick="classify('all')">Re-classify all</button>
+  <button class="danger" id="btnStopClassify" onclick="stopClassify()">Stop</button>
+  <div class="progress" id="classifyProgress"></div>
+  <div class="row" id="keyRow">
+    <input id="apiKey" type="password" placeholder="Paste Anthropic API key (sk-ant-…)">
+    <button class="secondary" onclick="saveKey()">Save</button>
+  </div>
+
+  <h4>3 · Import &amp; dedupe</h4>
+  <div class="muted">Paste a new list into the <b>Import</b> tab (needs an Email column) or pull one from Drive.</div>
+  <div class="row">
+    <input id="driveRef" placeholder="Google Sheet URL, file ID, or file name">
+    <button class="secondary" onclick="importDrive()">Import</button>
+  </div>
+  <div class="stats" style="margin-top:8px">
+    Rows in Import <b id="importRows">–</b><br>
+    NEW, ready to push <b id="importNew">–</b><br>
+    Already pushed <b id="importPushed">–</b>
+  </div>
+  <button class="primary" id="btnCheck" onclick="checkImport()">Check against Master</button>
+  <button class="secondary" id="btnPush" onclick="push()">Push NEW to Mail Merge</button>
+  <label class="chk"><input type="checkbox" id="sameCompany"> also push SAME_COMPANY rows</label>
+
+  <h4>4 · Pipeline</h4>
+  <button class="secondary" id="btnRecompute" onclick="recompute()">Recompute stages</button>
+  <button class="secondary" id="btnSync" onclick="sync()">Sync from Mail Merge</button>
+
+  <div id="status"></div>
+  <p class="muted" id="footer"></p>
+
+  <script>
+    var BUTTONS = ['btnScan', 'btnFull', 'btnStopScan', 'btnClassify', 'btnReclassify', 'btnStopClassify', 'btnCheck', 'btnPush', 'btnRecompute', 'btnSync'];
+    var pollTimer = null;
+    function $(id) { return document.getElementById(id); }
+    function setStatus(msg, cls) { var s = $('status'); s.textContent = msg || ''; s.className = cls || ''; }
+    function busy(b) { BUTTONS.forEach(function (id) { $(id).disabled = b; }); }
+    function run(fn, args, okMsg) {
+      busy(true); setStatus('Working…');
+      var r = google.script.run
+        .withSuccessHandler(function (msg) { busy(false); setStatus(msg || okMsg || 'Done.', 'ok'); loadData(); })
+        .withFailureHandler(function (e) { busy(false); setStatus(e.message, 'err'); loadData(); });
+      r[fn].apply(r, args || []);
+    }
+
+    function loadData() {
+      google.script.run
+        .withSuccessHandler(render)
+        .withFailureHandler(function (e) { setStatus(e.message, 'err'); })
+        .crmGetSidebarData();
+    }
+
+    function render(d) {
+      var c = d.counts;
+      $('contacts').textContent = c.contacts; $('unclassified').textContent = c.unclassified;
+      $('needsReply').textContent = c.needsReply; $('dormant').textContent = c.dormant;
+      $('importRows').textContent = c.importRows; $('importNew').textContent = c.importNew; $('importPushed').textContent = c.importPushed;
+      if (c.error) setStatus(c.error + '\nRun CRM → Set up / repair CRM tabs.', 'err');
+
+      var sb = $('scanBadge');
+      sb.textContent = d.scan.running ? 'scanning' : (d.classify.running ? 'classifying' : 'idle');
+      sb.className = 'badge ' + (d.scan.running || d.classify.running ? 'on' : 'off');
+      $('scanProgress').textContent = d.scan.running && d.scan.state
+        ? d.scan.state.threads + ' threads read, ' + d.scan.state.contacts + ' contact updates…'
+        : (d.scan.lastScanAt ? 'Last scan: ' + new Date(d.scan.lastScanAt).toLocaleString() : 'Never scanned. Full rescan reaches back to ' + d.scanSince + ' (Settings → ScanSince).');
+      $('classifyProgress').textContent = d.classify.running && d.classify.state
+        ? d.classify.state.processed + ' done (' + d.classify.state.rule + ' by rule, ' + d.classify.state.ai + ' by AI)…' : '';
+
+      var kb = $('keyBadge');
+      kb.textContent = d.hasApiKey ? 'key set' : 'no key';
+      kb.className = 'badge ' + (d.hasApiKey ? 'on' : 'warn');
+      $('keyRow').style.display = d.hasApiKey ? 'none' : 'flex';
+      $('modelLine').textContent = 'Model: ' + (d.model || '—') + (d.hasCompanyDescription ? '' : ' · Tip: fill Settings → CompanyDescription for better labels.');
+      $('footer').textContent = 'Signed in as ' + d.me + '. Jobs keep running after you close this sheet.';
+
+      if (d.scan.running || d.classify.running) { if (!pollTimer) pollTimer = setInterval(loadData, 8000); }
+      else if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    function scan(full) {
+      if (full && !confirm('Full rescan re-reads all sent mail back to ScanSince. Continue?')) return;
+      run('crmSidebarStartScan', [full]);
+    }
+    function stopScan() { run('crmSidebarStopScan'); }
+    function classify(mode) {
+      if (mode === 'all' && !confirm('Re-classify every unlocked contact? Locked rows and MANUAL rows are kept.')) return;
+      run('crmSidebarClassify', [mode]);
+    }
+    function stopClassify() { run('crmSidebarStopClassify'); }
+    function saveKey() { var k = $('apiKey').value.trim(); if (!k) return setStatus('Paste a key first.', 'err'); run('crmSidebarSetApiKey', [k]); $('apiKey').value = ''; }
+    function importDrive() { var ref = $('driveRef').value.trim(); if (!ref) return setStatus('Paste a Sheet URL, file ID, or name.', 'err'); run('crmSidebarImportDrive', [ref]); }
+    function checkImport() { run('crmSidebarCheckImport'); }
+    function push() { run('crmSidebarPush', [$('sameCompany').checked]); }
+    function recompute() { run('crmSidebarRecompute'); }
+    function sync() { run('crmSidebarSync'); }
+
+    loadData();
+  </script>
+</body>
+</html>

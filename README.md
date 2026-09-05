@@ -4,6 +4,8 @@ A YAMM-style mail merge that lives inside a Google Sheet, sends through your Gma
 
 **New here? Start with [TESTING.md](TESTING.md)** — a 15-minute walkthrough from blank spreadsheet to a merged test email in your own inbox.
 
+**Companion tool:** the [`crm/`](crm/) folder holds an email CRM that scans your sent Gmail, classifies contacts with Claude (investors, engineers, customers, …), tracks relationship stage, and dedupes new sourcing lists before they enter the mail merge. See [`crm/PLAN.md`](crm/PLAN.md) and [`crm/README.md`](crm/README.md).
+
 ## What's in this folder
 
 | File | Purpose |
