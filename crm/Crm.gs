@@ -12,18 +12,18 @@ var CRM_MASTER_COLUMNS = [
   // identity
   'Email', 'Name', 'FirstName', 'LastName', 'Company', 'Domain', 'Title',
   // classification
-  'Category', 'Stage', 'Confidence', 'Sentiment', 'AISummary', 'NextAction', 'ClassifiedBy', 'ClassifiedAt',
+  'Category', 'Stage', 'Confidence', 'ReviewNeeded', 'Evidence', 'Sentiment', 'AISummary', 'NextAction', 'ClassifiedBy', 'ClassifiedAt',
   // yours to edit
   'Lock', 'Tags', 'Notes', 'DoNotContact',
   // facts from Gmail / imports
   'Source', 'FirstSentAt', 'LastSentAt', 'LastReplyAt', 'LastTouchAt',
-  'SentCount', 'ReceivedCount', 'ThreadCount', 'NeedsReply', 'Bounced',
-  'Subjects', 'LastOutboundSnippet', 'LastInboundSnippet', 'ThreadIds', 'UpdatedAt'
+  'SentCount', 'ReceivedCount', 'AutoReplies', 'ThreadCount', 'NeedsReply', 'Bounced',
+  'Subjects', 'LastOutboundSnippet', 'LastInboundSnippet', 'Signature', 'ThreadIds', 'UpdatedAt'
 ];
 
 var CRM_INTERACTION_COLUMNS = [
   'ThreadId', 'Email', 'Subject', 'FirstMessageAt', 'LastMessageAt', 'Messages',
-  'Outbound', 'Inbound', 'LastDirection', 'LastFrom', 'LastSnippet', 'Link', 'Participants'
+  'Outbound', 'Inbound', 'AutoReplies', 'LastDirection', 'LastFrom', 'LastSnippet', 'LastInboundSnippet', 'Link', 'Participants'
 ];
 
 var CRM_IMPORT_USER_COLUMNS = ['Email', 'Name', 'FirstName', 'LastName', 'Company', 'Title', 'Notes'];
@@ -54,7 +54,9 @@ function buildCrmMenu_(ui) {
     .addSeparator()
     .addItem('Classify unclassified contacts', 'crmClassifyUnclassified')
     .addItem('Re-classify all (unlocked) contacts', 'crmClassifyAll')
+    .addItem('Preview classification (5 contacts, nothing saved)', 'crmPreviewClassificationPrompt')
     .addItem('Recompute pipeline stages', 'crmRecomputePipeline')
+    .addItem('Audit Master integrity', 'crmAuditPrompt')
     .addItem('Sync from mail merge Contacts', 'crmSyncFromMailMerge')
     .addSeparator()
     .addItem('Import from Drive file…', 'crmImportFromDrivePrompt')
@@ -66,6 +68,23 @@ function buildCrmMenu_(ui) {
     .addItem('Set up / repair CRM tabs', 'crmSetupSheet')
     .addItem('Stop all CRM triggers', 'crmStopEverything')
     .addToUi();
+}
+
+function crmPreviewClassificationPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  try {
+    var rows = crmPreviewClassification(5);
+    ui.alert('Preview (not saved)', rows.map(function (r) {
+      return r.email + '\n  ' + r.category + ' (' + Math.round(r.confidence * 100) + '%) · ' + r.relationship + (r.review ? ' · REVIEW' : '') + '\n  evidence: ' + r.evidence + '\n  ' + r.summary;
+    }).join('\n\n'), ui.ButtonSet.OK);
+  } catch (e) { ui.alert(String(e.message || e)); }
+}
+
+function crmAuditPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var rep = crmAudit();
+  var lines = rep.findings.map(function (f) { return '• ' + f.check + ': ' + f.count + (f.note ? ' — ' + f.note : '') + '\n    e.g. ' + f.examples.join(', '); });
+  ui.alert('Master audit', rep.summary + (lines.length ? '\n\n' + lines.join('\n') : '\n\nNo issues found.'), ui.ButtonSet.OK);
 }
 
 function showCrmSidebar() {
@@ -118,7 +137,12 @@ function crmSetupSheet() {
     ['Categories', CRM_DEFAULT_CATEGORIES.join(', '), 'Allowed categories. Edit freely; the classifier and dashboard follow this list.'],
     ['SnippetChars', 400, 'Excerpt length stored per contact and sent to the classifier. 0 = metadata only.'],
     ['MailMergeSheetUrl', '', 'Blank = the "Contacts" tab in this spreadsheet. Otherwise the URL of the mail merge spreadsheet.'],
-    ['ImportRecentDays', 30, 'Dedupe: a duplicate emailed within this many days is recommended "Skip".']
+    ['ImportRecentDays', 30, 'Dedupe: a duplicate emailed within this many days is recommended "Skip".'],
+    ['MinConfidence', 0.7, 'AI results below this confidence (0-1) get ReviewNeeded = TRUE and, if RetryLowConfidence is on, a second pass at higher effort.'],
+    ['RetryLowConfidence', true, 'Re-run low-confidence contacts one at a time at effort "high" with the full evidence pack.'],
+    ['EvidenceThreads', 3, 'How many recent threads per contact are sent to the classifier as evidence.'],
+    ['TreatMyDomainAsTeam', true, 'Treat everyone at your own (non-freemail) email domain as a teammate, not a contact. Turn off if you email customers at your own domain.'],
+    ['ScanWindowDays', 7, 'The scan walks the date range in windows of this many days so paging stays stable while new mail arrives. Lower to 1 if you send hundreds of emails a day.']
   ];
   if (settings.getLastRow() === 0) {
     settings.getRange(1, 1, 1, 3).setValues([['Setting', 'Value', 'Notes']]);
@@ -181,7 +205,7 @@ function crmApplyValidation_(ss) {
       SpreadsheetApp.newDataValidation().requireValueInList(cats, true).setAllowInvalid(true).build());
     master.getRange(2, map['stage'], rows, 1).setDataValidation(
       SpreadsheetApp.newDataValidation().requireValueInList(CRM_STAGES, true).setAllowInvalid(true).build());
-    ['lock', 'donotcontact', 'needsreply', 'bounced'].forEach(function (h) {
+    ['lock', 'donotcontact', 'needsreply', 'bounced', 'reviewneeded'].forEach(function (h) {
       master.getRange(2, map[h], rows, 1).insertCheckboxes();
     });
     master.getRange(2, map['aisummary'], rows, 1).setWrap(false);
@@ -201,9 +225,10 @@ function crmBuildDashboard_(ss) {
     ['Metric', 'Value'],
     ['Contacts', '=IFERROR(COUNTA(' + col('Email') + ')-1,0)'],
     ['Unclassified', '=IFERROR(COUNTIFS(' + col('Email') + ',"<>",' + col('Category') + ',""),0)'],
+    ['Needs review (low confidence)', C('ReviewNeeded', 'TRUE')],
     ['Needs reply', C('NeedsReply', 'TRUE')],
     ['Replied (any)', C('ReceivedCount', '">0"')],
-    ['Reply rate', '=IFERROR(B5/COUNTIF(' + col('SentCount') + ',">0"),"")'],
+    ['Reply rate', '=IFERROR(B6/COUNTIF(' + col('SentCount') + ',">0"),"")'],
     ['Dormant', C('Stage', '"Dormant"')],
     ['Meetings', C('Stage', '"Meeting"')],
     ['Won', C('Stage', '"Won"')],
@@ -212,8 +237,8 @@ function crmBuildDashboard_(ss) {
   ];
   dash.getRange(1, 1, rows.length, 2).setValues(rows);
   dash.getRange(1, 1, 1, 2).setFontWeight('bold');
-  dash.getRange('B6').setNumberFormat('0.0%');
-  dash.getRange('B11').setNumberFormat('yyyy-mm-dd hh:mm');
+  dash.getRange('B7').setNumberFormat('0.0%');
+  dash.getRange('B12').setNumberFormat('yyyy-mm-dd hh:mm');
 
   // Category × Stage matrix
   var top = rows.length + 2;
@@ -250,7 +275,7 @@ function crmSettings_() {
   out.MaxThreadsPerRun = Number(s.MaxThreadsPerRun) || 250;
   out.IgnoreDomains = crmSplitList_(s.IgnoreDomains).map(function (d) { return d.toLowerCase(); });
   out.Model = String(s.Model || 'claude-opus-5').trim();
-  out.ClassifyBatchSize = Math.max(1, Math.min(Number(s.ClassifyBatchSize) || 8, 25));
+  out.ClassifyBatchSize = Math.max(1, Math.min(Number(s.ClassifyBatchSize) || 8, 15));
   out.AutoClassifyAfterScan = s.AutoClassifyAfterScan === '' || s.AutoClassifyAfterScan === undefined ? true : crmBool_(s.AutoClassifyAfterScan);
   out.DormantDays = Number(s.DormantDays) || 45;
   out.Categories = crmSplitList_(s.Categories);
@@ -258,6 +283,11 @@ function crmSettings_() {
   out.SnippetChars = s.SnippetChars === '' || s.SnippetChars === undefined ? 400 : Math.max(0, Number(s.SnippetChars) || 0);
   out.MailMergeSheetUrl = String(s.MailMergeSheetUrl || '').trim();
   out.ImportRecentDays = Number(s.ImportRecentDays) || 30;
+  out.MinConfidence = s.MinConfidence === '' || s.MinConfidence === undefined ? 0.7 : Math.max(0, Math.min(1, Number(s.MinConfidence) || 0));
+  out.RetryLowConfidence = s.RetryLowConfidence === '' || s.RetryLowConfidence === undefined ? true : crmBool_(s.RetryLowConfidence);
+  out.EvidenceThreads = Math.max(0, Math.min(Number(s.EvidenceThreads === '' || s.EvidenceThreads === undefined ? 3 : s.EvidenceThreads) || 0, 6));
+  out.TreatMyDomainAsTeam = s.TreatMyDomainAsTeam === '' || s.TreatMyDomainAsTeam === undefined ? true : crmBool_(s.TreatMyDomainAsTeam);
+  out.ScanWindowDays = Math.max(1, Math.min(Number(s.ScanWindowDays) || 7, 60));
   return out;
 }
 
@@ -325,9 +355,10 @@ function crmColMap_(sheet, required) {
 }
 
 /**
- * Load a whole tab into memory: { sheet, headers, map, rows, index }.
- * `rows` are arrays aligned to `headers`; `index` maps a key (from keyFn) to row position.
- * Mutate rows via crmSet_/crmGet_, append via crmAppendRow_, then crmSaveTable_.
+ * Load a whole tab into memory: { sheet, headers, map, rows, index, keyFn }.
+ * `rows` are arrays aligned to `headers`; `index` maps keyFn(row) to row position.
+ * Mutate rows via crmSet_ (tracks which cells changed), append via crmAppendRow_,
+ * then crmSaveTable_ merges the changes back into whatever the sheet holds *now*.
  */
 function crmLoadTable_(name, required, keyFn) {
   var sheet = crmSheet_(name);
@@ -336,7 +367,7 @@ function crmLoadTable_(name, required, keyFn) {
   var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h).trim(); });
   var lastRow = sheet.getLastRow();
   var rows = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, lastCol).getValues() : [];
-  var t = { sheet: sheet, headers: headers, map: map, rows: rows, index: {}, dirty: false, appended: 0 };
+  var t = { sheet: sheet, headers: headers, map: map, rows: rows, index: {}, keyFn: keyFn || null, dirty: false, appended: 0 };
   if (keyFn) {
     rows.forEach(function (r, i) {
       var k = keyFn(r, t);
@@ -351,15 +382,22 @@ function crmGet_(t, row, header) {
   return c ? row[c - 1] : '';
 }
 
+/** Set a cell in memory and remember that this job changed it (row._d = {colIndex: true}). */
 function crmSet_(t, row, header, value) {
   var c = t.map[header.toLowerCase()];
   if (!c) return;
-  if (row[c - 1] !== value) { row[c - 1] = value; t.dirty = true; }
+  if (row[c - 1] !== value) {
+    row[c - 1] = value;
+    if (!row._d) row._d = {};
+    row._d[c] = true;
+    t.dirty = true;
+  }
 }
 
 function crmAppendRow_(t, key) {
   var row = [];
   for (var i = 0; i < t.headers.length; i++) row.push('');
+  row._new = true;
   t.rows.push(row);
   if (key) t.index[key] = t.rows.length - 1;
   t.dirty = true;
@@ -367,10 +405,66 @@ function crmAppendRow_(t, key) {
   return row;
 }
 
+/** Columns a human edit + Lock protects. If Lock was ticked while a job ran, the job's values for these are dropped. */
+var CRM_LOCK_PROTECTED = ['Category', 'Stage', 'Company', 'Title', 'Name', 'FirstName', 'LastName', 'Confidence', 'ReviewNeeded', 'Evidence', 'Sentiment', 'AISummary', 'NextAction', 'ClassifiedBy', 'ClassifiedAt', 'Tags'];
+
+/**
+ * Write changes back. Jobs run for minutes, so the sheet may have been edited, sorted, or
+ * had rows deleted meanwhile. With a keyFn, the current sheet contents are re-read and only
+ * the cells this job changed are applied to the matching (by key) current rows; new rows are
+ * appended. Rows the user deleted stay deleted unless this job changed them. A Lock ticked
+ * during the job wins over the job's classification columns. Without a keyFn the table is
+ * written positionally (only used for the short-lived Import tab).
+ */
 function crmSaveTable_(t) {
   if (!t.dirty || !t.rows.length) return;
-  t.sheet.getRange(2, 1, t.rows.length, t.headers.length).setValues(t.rows);
+  var width = t.headers.length;
+  var changed = t.rows.filter(function (r) { return r._d || r._new; });
+
+  if (!t.keyFn) {
+    t.sheet.getRange(2, 1, t.rows.length, width).setValues(t.rows.map(function (r) { return r.slice(0, width); }));
+  } else {
+    var lastRow = t.sheet.getLastRow();
+    var fresh = lastRow >= 2 ? t.sheet.getRange(2, 1, lastRow - 1, width).getValues() : [];
+    var freshIndex = {};
+    fresh.forEach(function (r, i) { var k = t.keyFn(r, t); if (k && !(k in freshIndex)) freshIndex[k] = i; });
+    var lockCol = t.map['lock'];
+    var protectedCols = {};
+    if (lockCol) CRM_LOCK_PROTECTED.forEach(function (h) { var c = t.map[h.toLowerCase()]; if (c) protectedCols[c] = true; });
+
+    var appended = [];
+    changed.forEach(function (row) {
+      var key = t.keyFn(row, t);
+      var j = key ? freshIndex[key] : undefined;
+      if (j === undefined) { appended.push(row.slice(0, width)); return; }
+      var target = fresh[j];
+      var lockedMeanwhile = lockCol && crmBool_(target[lockCol - 1]) && !crmBool_(row[lockCol - 1]);
+      var cols = row._new ? null : Object.keys(row._d).map(Number);
+      for (var c = 1; c <= width; c++) {
+        if (cols && cols.indexOf(c) === -1) continue;
+        if (lockedMeanwhile && protectedCols[c]) continue;
+        target[c - 1] = row[c - 1];
+      }
+    });
+    var out = fresh.concat(appended);
+    if (out.length) t.sheet.getRange(2, 1, out.length, width).setValues(out);
+  }
+  changed.forEach(function (r) { delete r._d; delete r._new; });
   t.dirty = false;
+}
+
+/**
+ * Persist a job's state only if the job is still the current one. Returns false if the job was
+ * stopped (property deleted) or replaced (a newer job started) while this tick was running, so
+ * the caller must not re-create the trigger or overwrite the newer state.
+ */
+function crmCommitState_(prop, state) {
+  var props = PropertiesService.getScriptProperties();
+  var raw = props.getProperty(prop);
+  if (!raw) return false;
+  try { if (JSON.parse(raw).startedAt !== state.startedAt) return false; } catch (e) { return false; }
+  props.setProperty(prop, JSON.stringify(state));
+  return true;
 }
 
 // ---------------------------------------------------------------- Email helpers (pure)
@@ -393,8 +487,12 @@ function crmDomainOf_(email) {
   return at === -1 ? '' : String(email).slice(at + 1).toLowerCase();
 }
 
-var CRM_FREEMAIL = { 'gmail.com': 1, 'yahoo.com': 1, 'outlook.com': 1, 'hotmail.com': 1, 'live.com': 1, 'icloud.com': 1, 'me.com': 1, 'aol.com': 1, 'protonmail.com': 1, 'proton.me': 1, 'hey.com': 1, 'msn.com': 1, 'ymail.com': 1, 'gmx.com': 1, 'fastmail.com': 1, 'yahoo.co.uk': 1, 'googlemail.com': 1 };
-function crmIsFreemail_(domain) { return !!CRM_FREEMAIL[String(domain || '').toLowerCase()]; }
+var CRM_FREEMAIL = { 'gmail.com': 1, 'googlemail.com': 1, 'yahoo.com': 1, 'ymail.com': 1, 'rocketmail.com': 1, 'outlook.com': 1, 'hotmail.com': 1, 'live.com': 1, 'msn.com': 1, 'icloud.com': 1, 'me.com': 1, 'mac.com': 1, 'aol.com': 1, 'protonmail.com': 1, 'proton.me': 1, 'pm.me': 1, 'hey.com': 1, 'gmx.com': 1, 'gmx.net': 1, 'gmx.de': 1, 'web.de': 1, 'fastmail.com': 1, 'fastmail.fm': 1, 'zoho.com': 1, 'mail.com': 1, 'email.com': 1, 'yandex.com': 1, 'yandex.ru': 1, 'mail.ru': 1, 'qq.com': 1, '163.com': 1, '126.com': 1, 'naver.com': 1, 'daum.net': 1, 'tutanota.com': 1, 'tuta.io': 1, 'duck.com': 1, 'comcast.net': 1, 'verizon.net': 1, 'att.net': 1, 'sbcglobal.net': 1, 'bellsouth.net': 1, 'cox.net': 1, 'btinternet.com': 1, 'sky.com': 1, 'orange.fr': 1, 'wanadoo.fr': 1, 'free.fr': 1, 'laposte.net': 1, 'sfr.fr': 1, 't-online.de': 1, 'libero.it': 1, 'virgilio.it': 1, 'seznam.cz': 1, 'wp.pl': 1, 'o2.pl': 1, 'rediffmail.com': 1 };
+var CRM_FREEMAIL_RE = /^(yahoo|ymail|hotmail|outlook|live|msn|googlemail|gmx|icloud|me|aol|protonmail|proton|yandex|mail)\.[a-z.]{2,8}$/;
+function crmIsFreemail_(domain) {
+  var d = String(domain || '').toLowerCase();
+  return !!CRM_FREEMAIL[d] || CRM_FREEMAIL_RE.test(d);
+}
 
 /**
  * Parse an RFC-style address list ("Jane Doe <jane@x.com>, bob@y.com") into
@@ -435,9 +533,9 @@ function crmSplitName_(name) {
   return { first: parts[0], last: parts[parts.length - 1] };
 }
 
-/** Addresses that are never real contacts. */
-var CRM_MACHINE_LOCAL_RE = /^(no-?reply|noreply|do-?not-?reply|donotreply|mailer-daemon|postmaster|bounce[s]?|notifications?|notify|alerts?|calendar-notification|drive-shares(-dm)?-noreply|comments-noreply|forms-receipts-noreply|docs-noreply|meet-recordings-noreply|unsubscribe|newsletter|digest|automated|robot|bot|system|daemon)(\+.*)?$/i;
-var CRM_MACHINE_DOMAIN_RE = /(^|\.)(calendar\.google\.com|docs\.google\.com|google\.com|googlegroups\.com|linkedin\.com|facebookmail\.com|twitter\.com|x\.com|intercom-mail\.com|hubspot\.com|zendesk\.com|calendly\.com|zoom\.us|slack\.com|notion\.so|stripe\.com|amazonses\.com|sendgrid\.net|mailchimp\.com|mailgun\.org|substack\.com|medium\.com|github\.com|atlassian\.net|figma\.com|docusign\.net|dropbox\.com)$/i;
+/** Addresses that are never real contacts. Local-part rules do the work; the domain list is only true bot/list senders. */
+var CRM_MACHINE_LOCAL_RE = /(^(mailer-daemon|postmaster|bounces?|notifications?|notify|alerts?|calendar-notification|unsubscribe|newsletter|digest|automated|robot|bot|system|daemon|invitations?|jobs-listings|jobalerts|receipts?|billing|invoices?)(\+.*)?$)|(no-?reply|do-?not-?reply|donotreply|noreply)/i;
+var CRM_MACHINE_DOMAIN_RE = /(^|\.)(calendar\.google\.com|docs\.google\.com|drive-shares\.google\.com|googlegroups\.com|facebookmail\.com|intercom-mail\.com|amazonses\.com|sendgrid\.net|mailgun\.org|mandrillapp\.com|sparkpostmail\.com|docusign\.net|calendly\.com|hellosign\.com)$/i;
 
 function crmIsMachineAddress_(email, ignoreDomains) {
   var e = String(email || '').toLowerCase();
@@ -445,7 +543,10 @@ function crmIsMachineAddress_(email, ignoreDomains) {
   var local = e.split('@')[0], domain = crmDomainOf_(e);
   if (CRM_MACHINE_LOCAL_RE.test(local)) return true;
   if (CRM_MACHINE_DOMAIN_RE.test(domain)) return true;
-  if (/^(reply|r|msg|m|bounce|b)[-+._][a-z0-9]{8,}/.test(local)) return true; // reply-tokens from SaaS tools
+  // Reply-token addresses from SaaS tools: reply+1a2b3c4d5e6f@…, msg-9f8e7d6c5b4a@…
+  // Requires a long token WITH digits so "r.stevenson@…" style human addresses are untouched.
+  var tok = local.match(/^(reply|msg|bounce|b|r|m)[-+._]([a-z0-9]{10,})$/);
+  if (tok && /\d/.test(tok[2])) return true;
   for (var i = 0; i < (ignoreDomains || []).length; i++) {
     var d = ignoreDomains[i];
     if (domain === d || domain.slice(-(d.length + 1)) === '.' + d) return true;
@@ -454,32 +555,101 @@ function crmIsMachineAddress_(email, ignoreDomains) {
 }
 
 /**
- * Plain-text excerpt: strip quoted history, signatures, and whitespace; clip to maxChars.
+ * Split a plain-text body into { body, signature } with quoted history removed.
+ * The signature is the block after a "--" / "—" delimiter, or the trailing run of short
+ * lines that look like a sign-off (name, title, company, phone, URL).
  */
-function crmExcerpt_(plainBody, maxChars) {
+function crmSplitBody_(plainBody) {
   var text = String(plainBody || '').replace(/\r/g, '');
   // Cut at the start of quoted history.
   var cutters = [
     /\n\s*On [\s\S]{5,200}?wrote:\s*\n/,     // "On Mon, Jan 1 … <x@y> wrote:" (may wrap)
     /\n\s*-{2,}\s*Original Message\s*-{2,}/i,
-    /\n\s*From:\s.+\n\s*(Sent|Date):\s.+/i,  // Outlook-style header block
+    /\n\s*-{2,}\s*Forwarded message\s*-{2,}/i,
+    /\n\s*From:\s.+\n\s*(Sent|Date|To):\s.+/i, // Outlook-style header block
     /\n\s*_{5,}\s*\n/,                       // Outlook separator
     /\n\s*Le .{5,200}? a écrit\s*:/,         // French
-    /\n\s*Am .{5,200}? schrieb .{0,80}:/     // German
+    /\n\s*Am .{5,200}? schrieb .{0,80}:/,    // German
+    /\n\s*El .{5,200}? escribió:/            // Spanish
   ];
   cutters.forEach(function (re) { var m = text.match(re); if (m && m.index > 0) text = text.slice(0, m.index); });
-  // Drop quoted lines and the signature block.
   var lines = text.split('\n').filter(function (l) { return !/^\s*>/.test(l); });
-  var sig = -1;
+  // Trim trailing blank lines.
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+
+  var sigStart = -1;
   for (var i = 0; i < lines.length; i++) {
-    if (/^\s*(--|—|__)\s*$/.test(lines[i]) || /^\s*(Sent from my|Get Outlook for)/i.test(lines[i])) { sig = i; break; }
+    if (/^\s*(--|—|__)\s*$/.test(lines[i]) || /^\s*(Sent from my|Get Outlook for|Sent via)/i.test(lines[i])) { sigStart = i; break; }
   }
-  if (sig > 0) lines = lines.slice(0, sig);
-  text = lines.join('\n').replace(/\[image:[^\]]*\]/gi, '').replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
+  if (sigStart === -1) {
+    // Heuristic sign-off: the last paragraph, if it is ≤ 6 short lines and contains a sign-off cue.
+    var lastBlank = -1;
+    for (var j = lines.length - 1; j >= 0; j--) if (!lines[j].trim()) { lastBlank = j; break; }
+    var tail = lines.slice(lastBlank + 1);
+    var cue = /(^\s*(best|thanks|thank you|regards|cheers|sincerely|warmly|talk soon|kind regards|br|rgds)[,!.]?\s*$)|(\+?\d[\d\s().-]{7,}\d)|(https?:\/\/|www\.)|(\b(ceo|cto|coo|cfo|founder|co-founder|partner|principal|associate|director|manager|engineer|vp|head of)\b)/i;
+    if (tail.length >= 2 && tail.length <= 7 && tail.every(function (l) { return l.length <= 80; }) && tail.some(function (l) { return cue.test(l); })) {
+      sigStart = lastBlank + 1;
+    }
+  }
+  var bodyLines = sigStart >= 0 ? lines.slice(0, sigStart) : lines;
+  var sigLines = sigStart >= 0 ? lines.slice(sigStart).filter(function (l) { return !/^\s*(--|—|__)\s*$/.test(l); }) : [];
+  var clean = function (arr) {
+    return arr.join('\n').replace(/\[image:[^\]]*\]/gi, '').replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
+  };
+  return { body: clean(bodyLines), signature: clean(sigLines).slice(0, 300) };
+}
+
+/** Clip to maxChars on a word boundary with an ellipsis. maxChars 0 means "no text at all". */
+function crmClip_(text, maxChars) {
   if (maxChars === 0) return '';
+  var t = String(text || '');
   var max = maxChars || 400;
-  if (text.length > max) text = text.slice(0, max).replace(/\s+\S*$/, '') + '…';
-  return text;
+  return t.length > max ? t.slice(0, max).replace(/\s+\S*$/, '') + '…' : t;
+}
+
+/** Plain-text excerpt of the message body (quoted history and signature removed), clipped to maxChars. */
+function crmExcerpt_(plainBody, maxChars) {
+  if (maxChars === 0) return '';
+  return crmClip_(crmSplitBody_(plainBody).body, maxChars);
+}
+
+/** Auto-replies (out of office, vacation responders, "Automatic reply") must not count as replies. */
+var CRM_AUTOREPLY_SUBJECT_RE = /^\s*((re|fwd?):\s*)*(automatic reply|auto-?reply|autoreply|auto response|automated response|out of (the )?office|ooo\b|away from (the )?office|on vacation|on leave|abwesenheit|réponse automatique|respuesta automática|delivery status notification|undeliverable|undelivered mail|mail delivery (failed|subsystem)|failure notice)/i;
+function crmIsAutoReply_(subject, headers) {
+  if (CRM_AUTOREPLY_SUBJECT_RE.test(String(subject || ''))) return true;
+  var h = headers || {};
+  var auto = String(h['Auto-Submitted'] || h['auto-submitted'] || '').toLowerCase();
+  if (auto && auto !== 'no') return true;
+  if (String(h['X-Autoreply'] || h['X-Autorespond'] || h['X-Auto-Response-Suppress'] || '').trim()) return true;
+  var precedence = String(h['Precedence'] || '').toLowerCase();
+  if (precedence === 'bulk' || precedence === 'junk' || precedence === 'auto_reply') return true;
+  return false;
+}
+
+/** Deterministic opt-out detection on inbound text. Conservative on purpose: false positives suppress a real contact. */
+var CRM_OPTOUT_RE = /\b(unsubscribe( me)?|remove me from (your|this|the) (list|mailing)|take me off (your|this|the) list|stop (emailing|contacting|messaging) (me|us)|do not (email|contact) (me|us)( again)?|don'?t (email|contact) (me|us)( again)?|no longer interested|not interested,? thanks|please stop)\b/i;
+function crmIsOptOut_(text) {
+  return CRM_OPTOUT_RE.test(String(text || ''));
+}
+
+/** "Dr. Jane Q. van der Doe (she/her)" → "jane doe"; used for possible-same-person matching. */
+function crmNormalizeName_(name) {
+  var n = String(name || '').toLowerCase();
+  try { n = n.normalize('NFD').replace(/[̀-ͯ]/g, ''); } catch (e) { /* older runtime */ }
+  n = n.replace(/\([^)]*\)/g, ' ')                                  // (she/her), (Acme)
+    .replace(/\b(dr|mr|mrs|ms|prof|sir|jr|sr|ii|iii|phd|mba|md)\b\.?/g, ' ')
+    .replace(/[^a-z\s'-]/g, ' ').replace(/\s+/g, ' ').trim();
+  var parts = n.split(' ').filter(String);
+  if (parts.length >= 2) return parts[0] + ' ' + parts[parts.length - 1];
+  return parts.join(' ');
+}
+
+/** "Acme, Inc." → "acme"; "The Acme Company LLC" → "acme". */
+function crmNormalizeCompany_(company) {
+  return String(company || '').toLowerCase()
+    .replace(/[^a-z0-9\s&]/g, ' ')
+    .replace(/\b(the|inc|incorporated|llc|ltd|limited|co|corp|corporation|company|gmbh|ag|sa|plc|group|holdings|ventures|capital|partners|labs)\b/g, ' ')
+    .replace(/\s+/g, ' ').trim();
 }
 
 // ---------------------------------------------------------------- Logging / triggers

@@ -114,22 +114,17 @@ function crmCheckImport() {
   if (!imp.rows.length) return 'Import tab is empty.';
   var master = crmLoadTable_('Master', CRM_MASTER_COLUMNS, function (r, t) { return crmNormalizeEmail_(crmGet_(t, r, 'Email')); });
 
-  // Domain index: best (most advanced) contact per non-freemail domain.
-  var byDomain = {};
-  master.rows.forEach(function (row) {
-    var email = crmNormalizeEmail_(crmGet_(master, row, 'Email'));
-    if (!email) return;
-    var d = crmDomainOf_(email);
-    if (!d || crmIsFreemail_(d)) return;
-    var cur = byDomain[d];
-    if (!cur || crmStageRank_(crmGet_(master, row, 'Stage')) > crmStageRank_(crmGet_(master, cur, 'Stage'))) byDomain[d] = row;
-  });
+  var idx = crmBuildDedupeIndexes_(master);
 
   var seen = {};
   var counts = {};
   imp.rows.forEach(function (row) {
     var email = crmNormalizeEmail_(crmGet_(imp, row, 'Email'));
-    var res = crmDedupeRow_(email, seen, master, byDomain, settings);
+    var person = {
+      name: String(crmGet_(imp, row, 'Name') || ((String(crmGet_(imp, row, 'FirstName') || '') + ' ' + String(crmGet_(imp, row, 'LastName') || '')).trim())),
+      company: String(crmGet_(imp, row, 'Company') || '')
+    };
+    var res = crmDedupeRow_(email, seen, master, idx, settings, person);
     seen[email] = true;
     crmSet_(imp, row, 'DedupeStatus', res.status);
     crmSet_(imp, row, 'MatchedName', res.matchedName);
@@ -149,13 +144,52 @@ function crmCheckImport() {
 }
 
 /**
- * Pure-ish dedupe decision for one import row (unit-tested).
- * master: loaded Master table; byDomain: domain → best master row.
+ * Indexes over Master for dedupe:
+ *  byDomain: non-freemail domain → most advanced Master row at that company
+ *  byName:   normalized "first last" → [rows]  (possible same person, other email)
+ *  queued:   emails already present in the mail merge Contacts tab (any status)
  */
-function crmDedupeRow_(email, seenInImport, master, byDomain, settings) {
+function crmBuildDedupeIndexes_(master) {
+  var byDomain = {}, byName = {};
+  master.rows.forEach(function (row) {
+    var email = crmNormalizeEmail_(crmGet_(master, row, 'Email'));
+    if (!email) return;
+    var d = crmDomainOf_(email);
+    if (d && !crmIsFreemail_(d)) {
+      var cur = byDomain[d];
+      if (!cur || crmStageRank_(crmGet_(master, row, 'Stage')) > crmStageRank_(crmGet_(master, cur, 'Stage'))) byDomain[d] = row;
+    }
+    var nn = crmNormalizeName_(crmGet_(master, row, 'Name') || ((String(crmGet_(master, row, 'FirstName') || '') + ' ' + String(crmGet_(master, row, 'LastName') || '')).trim()));
+    if (nn && nn.indexOf(' ') !== -1) (byName[nn] = byName[nn] || []).push(row);
+  });
+  var queued = {};
+  try { queued = crmMailMergeQueuedEmails_(crmMailMergeContactsSheet_(false)); } catch (e) { /* no mail merge sheet configured — fine */ }
+  return { byDomain: byDomain, byName: byName, queued: queued };
+}
+
+/** Normalized emails already present in the mail merge Contacts tab (any status). */
+function crmMailMergeQueuedEmails_(contacts) {
+  var out = {};
+  var cmap = crmColMap_(contacts, ['Email']);
+  if (contacts.getLastRow() >= 2) {
+    contacts.getRange(2, cmap['email'], contacts.getLastRow() - 1, 1).getValues().forEach(function (r) {
+      var e = crmNormalizeEmail_(r[0]); if (e) out[e] = true;
+    });
+  }
+  return out;
+}
+
+/**
+ * Pure dedupe decision for one import row (unit-tested).
+ * email: normalized; seenInImport: emails earlier in this list; idx: crmBuildDedupeIndexes_ output;
+ * person: { name, company } from the import row (for possible-same-person matching).
+ */
+function crmDedupeRow_(email, seenInImport, master, idx, settings, person) {
   var out = { status: 'NEW', matchedName: '', matchedCategory: '', matchedStage: '', lastTouch: '', recommendation: 'Send' };
   if (!email) { out.status = 'INVALID'; out.recommendation = 'Fix email'; return out; }
   if (seenInImport[email]) { out.status = 'DUPLICATE_IN_IMPORT'; out.recommendation = 'Skip — repeated in this list'; return out; }
+  idx = idx || {}; person = person || {};
+  var byDomain = idx.byDomain || {}, byName = idx.byName || {}, queued = idx.queued || {};
 
   var fill = function (row) {
     out.matchedName = String(crmGet_(master, row, 'Name') || crmGet_(master, row, 'Email'));
@@ -164,23 +198,56 @@ function crmDedupeRow_(email, seenInImport, master, byDomain, settings) {
     var lt = crmGet_(master, row, 'LastTouchAt');
     out.lastTouch = lt instanceof Date ? lt : '';
   };
+  var suppressed = function (row) {
+    var st = String(crmGet_(master, row, 'Stage') || '');
+    return crmBool_(crmGet_(master, row, 'DoNotContact')) || crmBool_(crmGet_(master, row, 'Bounced')) || st === 'Not Interested' || st === 'Bounced';
+  };
 
+  // 1) Exact email already in Master.
   if (master.index[email] !== undefined) {
     var row = master.rows[master.index[email]];
     out.status = 'DUPLICATE';
     fill(row);
     var stage = out.matchedStage;
     var days = crmDaysAgo_(crmGet_(master, row, 'LastTouchAt'));
-    if (crmBool_(crmGet_(master, row, 'DoNotContact')) || crmBool_(crmGet_(master, row, 'Bounced')) || stage === 'Not Interested' || stage === 'Bounced') out.recommendation = 'Skip — do not contact';
+    if (suppressed(row)) out.recommendation = 'Skip — do not contact';
     else if (stage === 'Replied' || stage === 'Engaged' || stage === 'Meeting' || stage === 'Won') out.recommendation = 'Skip — already in conversation';
     else if (crmBool_(crmGet_(master, row, 'NeedsReply'))) out.recommendation = 'Skip — they are waiting on your reply';
+    else if (queued[email]) out.recommendation = 'Skip — already queued in Mail Merge';
     else if (days <= (settings.ImportRecentDays || 30)) out.recommendation = 'Skip — emailed ' + Math.round(days) + ' day(s) ago';
-    else if (stage === 'New') out.recommendation = 'Send — already queued, never sent';
+    else if (stage === 'New') out.recommendation = 'Send — already in Master, never sent';
     else out.recommendation = 'Re-engage — reference prior thread';
     return out;
   }
 
+  // 2) Already sitting in the mail merge queue under this exact email (not yet scanned into Master).
+  if (queued[email]) { out.status = 'QUEUED'; out.recommendation = 'Skip — already queued in Mail Merge'; return out; }
+
+  // 3) Same person, different address: same normalized name AND (same company name OR same non-freemail domain).
+  var nn = crmNormalizeName_(person.name);
   var domain = crmDomainOf_(email);
+  if (nn && nn.indexOf(' ') !== -1 && byName[nn]) {
+    var impCompany = crmNormalizeCompany_(person.company);
+    var hit = null;
+    for (var i = 0; i < byName[nn].length; i++) {
+      var cand = byName[nn][i];
+      var cEmail = crmNormalizeEmail_(crmGet_(master, cand, 'Email'));
+      var cDomain = crmDomainOf_(cEmail);
+      var cCompany = crmNormalizeCompany_(crmGet_(master, cand, 'Company'));
+      var sameDomain = domain && !crmIsFreemail_(domain) && cDomain === domain;
+      var sameCompany = impCompany && cCompany && (impCompany === cCompany || impCompany.indexOf(cCompany) === 0 || cCompany.indexOf(impCompany) === 0);
+      if (sameDomain || sameCompany) { hit = cand; break; }
+    }
+    if (hit) {
+      out.status = 'POSSIBLE_MATCH';
+      fill(hit);
+      var other = crmNormalizeEmail_(crmGet_(master, hit, 'Email'));
+      out.recommendation = (suppressed(hit) ? 'Skip — ' : 'Review — ') + 'likely the same person as ' + other + ' (' + (out.matchedStage || 'in Master') + ')';
+      return out;
+    }
+  }
+
+  // 4) Someone else at the same company.
   if (domain && !crmIsFreemail_(domain) && byDomain[domain]) {
     var best = byDomain[domain];
     out.status = 'SAME_COMPANY';
@@ -208,7 +275,7 @@ function crmColorImport_(imp) {
     var range = imp.sheet.getRange(2, col, n, 1);
     var colors = imp.rows.map(function (row) {
       var s = String(crmGet_(imp, row, 'DedupeStatus'));
-      return [s === 'NEW' ? '#e6f4ea' : s === 'SAME_COMPANY' ? '#fef7e0' : s === 'INVALID' ? '#f1f3f4' : '#fce8e6'];
+      return [s === 'NEW' ? '#e6f4ea' : (s === 'SAME_COMPANY' || s === 'POSSIBLE_MATCH') ? '#fef7e0' : s === 'INVALID' ? '#f1f3f4' : '#fce8e6'];
     });
     range.setBackgrounds(colors);
   } catch (e) { /* cosmetic */ }
@@ -233,16 +300,7 @@ function crmPushToMailMerge(statuses) {
 
   var contacts = crmMailMergeContactsSheet_(true);
   var cHeaders = contacts.getRange(1, 1, 1, contacts.getLastColumn()).getValues()[0].map(function (h) { return String(h).trim(); });
-  var cLower = cHeaders.map(function (h) { return h.toLowerCase(); });
-  if (cLower.indexOf('email') === -1) throw new Error('The Contacts tab has no "Email" column.');
-
-  // Existing Contacts emails → don't double-queue.
-  var existing = {};
-  if (contacts.getLastRow() >= 2) {
-    contacts.getRange(2, cLower.indexOf('email') + 1, contacts.getLastRow() - 1, 1).getValues().forEach(function (r) {
-      var e = crmNormalizeEmail_(r[0]); if (e) existing[e] = true;
-    });
-  }
+  var existing = crmMailMergeQueuedEmails_(contacts); // throws if Contacts has no Email column
 
   var master = crmLoadTable_('Master', CRM_MASTER_COLUMNS, function (r, t) { return crmNormalizeEmail_(crmGet_(t, r, 'Email')); });
   var outRows = [];

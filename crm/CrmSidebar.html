@@ -23,6 +23,9 @@
     .badge.on { background: #e6f4ea; color: #188038; }
     .badge.off { background: #f1f3f4; color: #5f6368; }
     .badge.warn { background: #fef7e0; color: #b06000; }
+    table { border-collapse: collapse; width: 100%; margin-top: 6px; font-size: 11px; }
+    td { border-top: 1px solid #eee; padding: 4px 2px; vertical-align: top; }
+    td.k { color: #5f6368; white-space: nowrap; padding-right: 6px; }
     .progress { font-size: 12px; color: #1a73e8; margin-top: 4px; }
     label.chk { display: block; margin-top: 6px; font-size: 12px; }
   </style>
@@ -33,6 +36,7 @@
   <div class="stats">
     Contacts in Master <b id="contacts">–</b><br>
     Unclassified <b id="unclassified">–</b><br>
+    Needs review (low confidence) <b id="review">–</b><br>
     Waiting on your reply <b id="needsReply">–</b><br>
     Dormant <b id="dormant">–</b>
   </div>
@@ -46,10 +50,12 @@
 
   <h4>2 · Classify with Claude <span id="keyBadge" class="badge off">no key</span></h4>
   <div class="muted" id="modelLine"></div>
+  <button class="secondary" id="btnPreview" onclick="preview()">Preview 5 (nothing saved)</button>
   <button class="primary" id="btnClassify" onclick="classify('unclassified')">Classify unclassified</button>
   <button class="secondary" id="btnReclassify" onclick="classify('all')">Re-classify all</button>
   <button class="danger" id="btnStopClassify" onclick="stopClassify()">Stop</button>
   <div class="progress" id="classifyProgress"></div>
+  <div id="previewWrap" style="display:none"><table id="previewTable"></table></div>
   <div class="row" id="keyRow">
     <input id="apiKey" type="password" placeholder="Paste Anthropic API key (sk-ant-…)">
     <button class="secondary" onclick="saveKey()">Save</button>
@@ -73,12 +79,14 @@
   <h4>4 · Pipeline</h4>
   <button class="secondary" id="btnRecompute" onclick="recompute()">Recompute stages</button>
   <button class="secondary" id="btnSync" onclick="sync()">Sync from Mail Merge</button>
+  <button class="secondary" id="btnAudit" onclick="audit()">Audit Master</button>
+  <div id="auditWrap" class="muted" style="display:none; white-space:pre-wrap; margin-top:6px"></div>
 
   <div id="status"></div>
   <p class="muted" id="footer"></p>
 
   <script>
-    var BUTTONS = ['btnScan', 'btnFull', 'btnStopScan', 'btnClassify', 'btnReclassify', 'btnStopClassify', 'btnCheck', 'btnPush', 'btnRecompute', 'btnSync'];
+    var BUTTONS = ['btnScan', 'btnFull', 'btnStopScan', 'btnPreview', 'btnClassify', 'btnReclassify', 'btnStopClassify', 'btnCheck', 'btnPush', 'btnRecompute', 'btnSync', 'btnAudit'];
     var pollTimer = null;
     function $(id) { return document.getElementById(id); }
     function setStatus(msg, cls) { var s = $('status'); s.textContent = msg || ''; s.className = cls || ''; }
@@ -101,7 +109,7 @@
     function render(d) {
       var c = d.counts;
       $('contacts').textContent = c.contacts; $('unclassified').textContent = c.unclassified;
-      $('needsReply').textContent = c.needsReply; $('dormant').textContent = c.dormant;
+      $('needsReply').textContent = c.needsReply; $('dormant').textContent = c.dormant; $('review').textContent = c.review;
       $('importRows').textContent = c.importRows; $('importNew').textContent = c.importNew; $('importPushed').textContent = c.importPushed;
       if (c.error) setStatus(c.error + '\nRun CRM → Set up / repair CRM tabs.', 'err');
 
@@ -109,7 +117,7 @@
       sb.textContent = d.scan.running ? 'scanning' : (d.classify.running ? 'classifying' : 'idle');
       sb.className = 'badge ' + (d.scan.running || d.classify.running ? 'on' : 'off');
       $('scanProgress').textContent = d.scan.running && d.scan.state
-        ? d.scan.state.threads + ' threads read, ' + d.scan.state.contacts + ' contact updates…'
+        ? Math.round((d.scan.state.progress || 0) * 100) + '% · ' + d.scan.state.threads + ' threads read, ' + d.scan.state.contacts + ' contact updates' + (d.scan.state.phase === 2 ? ' · checking old threads for replies' : '') + '…'
         : (d.scan.lastScanAt ? 'Last scan: ' + new Date(d.scan.lastScanAt).toLocaleString() : 'Never scanned. Full rescan reaches back to ' + d.scanSince + ' (Settings → ScanSince).');
       $('classifyProgress').textContent = d.classify.running && d.classify.state
         ? d.classify.state.processed + ' done (' + d.classify.state.rule + ' by rule, ' + d.classify.state.ai + ' by AI)…' : '';
@@ -135,6 +143,35 @@
       run('crmSidebarClassify', [mode]);
     }
     function stopClassify() { run('crmSidebarStopClassify'); }
+    function preview() {
+      busy(true); setStatus('Classifying 5 contacts (nothing will be saved)…');
+      google.script.run
+        .withSuccessHandler(function (rows) {
+          busy(false); setStatus('Preview ready — check the evidence column reads right before classifying everything.', 'ok');
+          var t = $('previewTable'); t.innerHTML = '';
+          rows.forEach(function (r) {
+            var tr = document.createElement('tr');
+            var k = document.createElement('td'); k.className = 'k'; k.textContent = r.email; tr.appendChild(k);
+            var v = document.createElement('td');
+            v.textContent = r.category + ' ' + Math.round(r.confidence * 100) + '% · ' + r.relationship + (r.review ? ' · REVIEW' : '') + '\n' + r.evidence + '\n' + r.summary;
+            v.style.whiteSpace = 'pre-wrap'; tr.appendChild(v); t.appendChild(tr);
+          });
+          $('previewWrap').style.display = 'block';
+        })
+        .withFailureHandler(function (e) { busy(false); setStatus(e.message, 'err'); })
+        .crmSidebarPreview(5);
+    }
+    function audit() {
+      busy(true); setStatus('Auditing…');
+      google.script.run
+        .withSuccessHandler(function (rep) {
+          busy(false); setStatus(rep.summary, rep.problems ? 'err' : 'ok');
+          var w = $('auditWrap'); w.style.display = 'block';
+          w.textContent = rep.findings.length ? rep.findings.map(function (f) { return '• ' + f.check + ': ' + f.count + (f.note ? ' — ' + f.note : '') + '\n   e.g. ' + f.examples.join(', '); }).join('\n') : 'No issues found.';
+        })
+        .withFailureHandler(function (e) { busy(false); setStatus(e.message, 'err'); })
+        .crmSidebarAudit();
+    }
     function saveKey() { var k = $('apiKey').value.trim(); if (!k) return setStatus('Paste a key first.', 'err'); run('crmSidebarSetApiKey', [k]); $('apiKey').value = ''; }
     function importDrive() { var ref = $('driveRef').value.trim(); if (!ref) return setStatus('Paste a Sheet URL, file ID, or name.', 'err'); run('crmSidebarImportDrive', [ref]); }
     function checkImport() { run('crmSidebarCheckImport'); }

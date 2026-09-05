@@ -3,7 +3,7 @@
  */
 
 function crmGetSidebarData() {
-  var out = { contacts: 0, unclassified: 0, needsReply: 0, dormant: 0, importRows: 0, importNew: 0, importPushed: 0 };
+  var out = { contacts: 0, unclassified: 0, review: 0, needsReply: 0, dormant: 0, importRows: 0, importNew: 0, importPushed: 0 };
   try {
     var master = crmSheet_('Master');
     var map = crmColMap_(master, CRM_MASTER_COLUMNS);
@@ -14,6 +14,7 @@ function crmGetSidebarData() {
         if (!String(r[map['email'] - 1]).trim()) return;
         out.contacts++;
         if (!String(r[map['category'] - 1]).trim()) out.unclassified++;
+        if (crmBool_(r[map['reviewneeded'] - 1])) out.review++;
         if (crmBool_(r[map['needsreply'] - 1])) out.needsReply++;
         if (String(r[map['stage'] - 1]) === 'Dormant') out.dormant++;
       });
@@ -59,3 +60,5 @@ function crmSidebarCheckImport() { return crmCheckImport(); }
 function crmSidebarPush(includeSameCompany) { return crmPushToMailMerge(includeSameCompany ? ['NEW', 'SAME_COMPANY'] : ['NEW']); }
 function crmSidebarImportDrive(ref) { return crmImportFromDrive(ref); }
 function crmSidebarSetApiKey(key) { crmSetApiKey(key); return 'API key saved.'; }
+function crmSidebarPreview(n) { return crmPreviewClassification(n || 5); }
+function crmSidebarAudit() { return crmAudit(); }

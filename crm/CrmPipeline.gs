@@ -134,3 +134,67 @@ function crmSyncFromMailMerge() {
   crmToast_(msg);
   return msg;
 }
+
+// ---------------------------------------------------------------- Audit
+
+/** Menu/sidebar entry: integrity report for Master. Returns the report text; also logged. */
+function crmAudit() {
+  var master = crmLoadTable_('Master', CRM_MASTER_COLUMNS);
+  var settings = crmSettings_();
+  var report = crmAuditMaster_(master, settings);
+  crmLog_('AUDIT', '', report.summary);
+  crmToast_(report.summary);
+  return report;
+}
+
+/**
+ * Pure audit over a loaded Master table. Returns { summary, findings: [{ check, count, examples }] }.
+ * Each check is an invariant the pipeline is supposed to maintain.
+ */
+function crmAuditMaster_(master, settings) {
+  var findings = [];
+  var add = function (check, rows, note) {
+    if (!rows.length) return;
+    findings.push({ check: check, count: rows.length, note: note || '', examples: rows.slice(0, 5).map(function (i) { return String(crmGet_(master, master.rows[i], 'Email')); }) });
+  };
+  var idx = function (pred) { var out = []; master.rows.forEach(function (r, i) { if (String(crmGet_(master, r, 'Email')).trim() && pred(r)) out.push(i); }); return out; };
+  var g = function (r, h) { return crmGet_(master, r, h); };
+  var n = function (r, h) { return Number(g(r, h)) || 0; };
+
+  // Duplicate normalized emails (should be impossible after a scan; happens after hand edits).
+  var seen = {}, dups = [];
+  master.rows.forEach(function (r, i) {
+    var e = crmNormalizeEmail_(g(r, 'Email'));
+    if (!e) return;
+    if (seen[e] !== undefined) dups.push(i); else seen[e] = i;
+  });
+  add('Duplicate emails after normalization', dups, 'Merge the rows by hand; the scan updates the first one only.');
+
+  add('Email cell not a valid address', idx(function (r) { return !crmNormalizeEmail_(g(r, 'Email')); }));
+  add('Unclassified (no Category)', idx(function (r) { return !String(g(r, 'Category')).trim(); }), 'Run Classify.');
+  add('Flagged for review (ReviewNeeded)', idx(function (r) { return crmBool_(g(r, 'ReviewNeeded')); }), 'Low confidence or unclear — check Evidence, fix by hand, tick Lock.');
+  add('Confidence below MinConfidence but not flagged', idx(function (r) {
+    var c = g(r, 'Confidence'); return String(g(r, 'Category')).trim() && c !== '' && Number(c) < settings.MinConfidence && !crmBool_(g(r, 'ReviewNeeded')) && String(g(r, 'ClassifiedBy')) === 'AI';
+  }));
+  add('AI-classified without Evidence', idx(function (r) { return String(g(r, 'ClassifiedBy')) === 'AI' && !String(g(r, 'Evidence')).trim(); }));
+  add('Stage disagrees with facts', idx(function (r) {
+    if (crmBool_(g(r, 'Lock'))) return false;
+    var expected = crmComputeStage_({
+      bounced: crmBool_(g(r, 'Bounced')), doNotContact: crmBool_(g(r, 'DoNotContact')), relationship: crmGetTag_(g(r, 'Tags'), 'rel:'),
+      sent: n(r, 'SentCount'), received: n(r, 'ReceivedCount'), daysSinceTouch: crmDaysAgo_(g(r, 'LastTouchAt')), currentStage: String(g(r, 'Stage')).trim()
+    }, settings.DormantDays);
+    return expected !== String(g(r, 'Stage')).trim();
+  }), 'Run Recompute pipeline stages.');
+  add('Replied but no inbound excerpt', idx(function (r) { return n(r, 'ReceivedCount') > 0 && !String(g(r, 'LastInboundSnippet')).trim() && String(g(r, 'Source')) === 'Scan' && settings.SnippetChars > 0; }), 'Usually an inbound message with an empty plain-text body.');
+  add('Counts without thread ids', idx(function (r) { return (n(r, 'SentCount') + n(r, 'ReceivedCount')) > 0 && !String(g(r, 'ThreadIds')).trim() && String(g(r, 'Source')) === 'Scan'; }));
+  add('NeedsReply on a suppressed contact', idx(function (r) { return crmBool_(g(r, 'NeedsReply')) && (crmBool_(g(r, 'DoNotContact')) || crmBool_(g(r, 'Bounced'))); }));
+  add('Opted out but still contactable', idx(function (r) { return crmSplitList_(g(r, 'Tags')).indexOf('optout') !== -1 && !crmBool_(g(r, 'DoNotContact')); }), 'Someone cleared DoNotContact after an opt-out was detected.');
+  add('Category "Ignore" still in Master', idx(function (r) { return String(g(r, 'Category')) === 'Ignore'; }), 'Add a Rules row (IGNORE) for the domain and delete these rows.');
+  add('Locked rows', idx(function (r) { return crmBool_(g(r, 'Lock')); }), 'Informational.');
+
+  var total = idx(function () { return true; }).length;
+  var problems = findings.filter(function (f) { return f.check !== 'Locked rows' && f.check !== 'Flagged for review (ReviewNeeded)'; })
+    .reduce(function (a, f) { return a + f.count; }, 0);
+  var summary = 'Audit: ' + total + ' contacts, ' + problems + ' integrity issue(s)' + (findings.length ? ' — ' + findings.map(function (f) { return f.check + ': ' + f.count; }).join('; ') : '') + '.';
+  return { summary: summary, findings: findings, total: total, problems: problems };
+}
